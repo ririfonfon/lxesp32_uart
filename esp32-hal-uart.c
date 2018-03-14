@@ -29,6 +29,22 @@
 #include "soc/dport_reg.h"
 #include "esp_intr_alloc.h"
 
+//begin mod   ****************************************************
+//            USE_SLIP_FOR_BREAK_DETECT causes ISR to use SLIP encoding for bytes
+//            sent to queue when a uart's break detect interrupt is enabled.
+//            A detected break is encoded as SLIP_END.
+#define USE_SLIP_FOR_BREAK_DETECT 1
+
+//Special Byte Definitions for SLIP Encoding
+#define SLIP_END      0xC0
+#define SLIP_ESC      0xDB
+#define SLIP_ESC_ESC  0xDC
+#define SLIP_ESC_END  0xDD
+//end mod   ****************************************************
+
+#define ETS_UART_INUM  5
+#define ETS_UART2_INUM  ETS_UART_INUM
+
 #define UART_REG_BASE(u)    ((u==0)?DR_REG_UART_BASE:(      (u==1)?DR_REG_UART1_BASE:(    (u==2)?DR_REG_UART2_BASE:0)))
 #define UART_RXD_IDX(u)     ((u==0)?U0RXD_IN_IDX:(          (u==1)?U1RXD_IN_IDX:(         (u==2)?U2RXD_IN_IDX:0)))
 #define UART_TXD_IDX(u)     ((u==0)?U0TXD_OUT_IDX:(         (u==1)?U1TXD_OUT_IDX:(        (u==2)?U2TXD_OUT_IDX:0)))
@@ -78,16 +94,78 @@ static void IRAM_ATTR _uart_isr(void *arg)
             continue;
         }
         uart->dev->int_clr.rxfifo_full = 1;
-        uart->dev->int_clr.frm_err = 1;
-        uart->dev->int_clr.rxfifo_tout = 1;
-        while(uart->dev->status.rxfifo_cnt) {
-            c = uart->dev->fifo.rw_byte;
-            if(uart->queue != NULL && !xQueueIsQueueFullFromISR(uart->queue)) {
-                xQueueSendFromISR(uart->queue, &c, &xHigherPriorityTaskWoken);
-            }
-        }
-    }
+		uart->dev->int_clr.frm_err = 1;
+		uart->dev->int_clr.rxfifo_tout = 1;
+		
+//begin mod ****************************************************        
+#if USE_SLIP_FOR_BREAK_DETECT
 
+		// if break detect interrupt is enabled, use SLIP encoding 
+        if ( uart->dev->int_ena.brk_det ) {
+        	while(uart->dev->status.rxfifo_cnt) {
+				c = uart->dev->fifo.rw_byte;
+		
+				// encode incoming byte using SLIP
+				// SLIP is simple and uses a special byte SLIP_END to mark the end
+				// of a packet.  If the special byte appears as data, it is escaped
+				// as follows:
+				// if byte == SLIP_END replace with SLIP_ESC followed by SLIP_ESC_END
+				if ( c == SLIP_END ) {
+					c = SLIP_ESC;
+					if(uart->queue != NULL && !xQueueIsQueueFullFromISR(uart->queue)) {
+						xQueueSendFromISR(uart->queue, &c, &xHigherPriorityTaskWoken);
+					}
+					c = SLIP_ESC_END;
+					if(uart->queue != NULL && !xQueueIsQueueFullFromISR(uart->queue)) {
+						xQueueSendFromISR(uart->queue, &c, &xHigherPriorityTaskWoken);
+					}
+				// if byte == SLIP_ESC replace with SLIP_ESC followed by SLIP_ESC_ESC
+				} else if ( c == SLIP_ESC ) {
+					c = SLIP_ESC;
+					if(uart->queue != NULL && !xQueueIsQueueFullFromISR(uart->queue)) {
+						xQueueSendFromISR(uart->queue, &c, &xHigherPriorityTaskWoken);
+					}
+					c = SLIP_ESC_ESC;
+					if(uart->queue != NULL && !xQueueIsQueueFullFromISR(uart->queue)) {
+						xQueueSendFromISR(uart->queue, &c, &xHigherPriorityTaskWoken);
+					}
+				//otherwise just queue the byte
+				} else {
+					if(uart->queue != NULL && !xQueueIsQueueFullFromISR(uart->queue)) {
+						xQueueSendFromISR(uart->queue, &c, &xHigherPriorityTaskWoken);
+					}
+				}
+			}
+        	// send SLIP END when break is detected to mark end of packet
+			if (uart->dev->int_st.brk_det) {
+				c = SLIP_END;
+				if(uart->queue != NULL && !xQueueIsQueueFullFromISR(uart->queue)) {
+					xQueueSendFromISR(uart->queue, &c, &xHigherPriorityTaskWoken);
+					uart->dev->int_clr.brk_det = 1;
+				}
+				
+				//uart->dev->int_clr.brk_det = 1;
+			}
+        } else {
+        
+#endif
+//end mod ****************************************************  
+
+			while(uart->dev->status.rxfifo_cnt) {
+				c = uart->dev->fifo.rw_byte;
+				if(uart->queue != NULL && !xQueueIsQueueFullFromISR(uart->queue)) {
+					xQueueSendFromISR(uart->queue, &c, &xHigherPriorityTaskWoken);
+				}
+			}
+			
+//begin mod ****************************************************  
+#if USE_SLIP_FOR_BREAK_DETECT
+		}
+#endif
+//end mod ****************************************************  
+
+    }   	// for loop uart[0..2]
+	
     if (xHigherPriorityTaskWoken) {
         portYIELD_FROM_ISR();
     }
